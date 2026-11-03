@@ -1,0 +1,18 @@
+package: community.lazycat.app.solidtime
+name: Solidtime
+version: 0.0.0
+description: "Time tracking for freelancers and teams: projects, tasks, billable hours and reports."
+min_os_version: "1.5.0"
+homepage: https://www.solidtime.io/
+author: solidtime
+license: AGPL-3.0
+permissions:
+  required:
+    - net.internet
+locales:
+  zh:
+    name: Solidtime
+    description: "时间追踪：项目、任务、可计费工时与报表。"
+  en:
+    name: Solidtime
+    description: "Time tracking for freelancers and teams: projects, tasks, billable hours and reports."

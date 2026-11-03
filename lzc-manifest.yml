@@ -1,0 +1,129 @@
+application:
+  subdomain: solidtime
+  multi_instance: false
+  # Solidtime has its own accounts (including a super-admin panel), so it is
+  # exposed directly rather than behind the platform login gate.
+  public_path:
+    - /
+  upstreams:
+    - location: /package-licenses/
+      backend: file:///lzcapp/pkg/content/licenses/
+    - location: /
+      backend: http://solidtime:8000/
+
+services:
+  db:
+    image: docker.1ms.run/library/postgres:15-alpine
+    environment:
+      - POSTGRES_DB=solidtime
+      - POSTGRES_USER=solidtime
+      - |-
+        POSTGRES_PASSWORD={{ printf "%x" (stable_secret "solidtime_db_password") }}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -q -d solidtime -U solidtime
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    binds:
+      - /lzcapp/var/pgdata:/var/lib/postgresql/data
+
+  solidtime:
+    # upstream: solidtime/solidtime:0.22.1
+    # The official image switches role on CONTAINER_MODE; "http" serves the app.
+    image: docker.1ms.run/solidtime/solidtime:0.22.1
+    depends_on:
+      - db
+    environment:
+      - CONTAINER_MODE=http
+      # Tables are created on first boot instead of by a separate init step.
+      - AUTO_DB_MIGRATE=true
+      - APP_ENV=production
+      - APP_DEBUG=false
+      - |-
+        APP_URL=https://{{ .S.AppDomain }}
+      # The ingress terminates TLS and talks plain http to the container.
+      - APP_FORCE_HTTPS=true
+      - TRUSTED_PROXIES=0.0.0.0/0
+      # Required: without a key sessions and encryption do not work. 32 bytes,
+      # base64 encoded, which is what Laravel expects.
+      - |-
+        APP_KEY=base64:{{ printf "%.32s" (printf "%s%s" (stable_secret "solidtime_app_key_a") (stable_secret "solidtime_app_key_b")) | b64enc }}
+      - DB_CONNECTION=pgsql
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_DATABASE=solidtime
+      - DB_USERNAME=solidtime
+      - |-
+        DB_PASSWORD={{ printf "%x" (stable_secret "solidtime_db_password") }}
+      # Database-backed queue; the worker service below consumes it.
+      - QUEUE_CONNECTION=database
+      - SESSION_DRIVER=database
+      - |-
+        SUPER_ADMINS={{ .U.admin_email }}
+      # Registration stays open only long enough to create the first account;
+      # it is closed again by the admin from the panel.
+      - APP_ENABLE_REGISTRATION=on
+      - TZ=Asia/Shanghai
+    binds:
+      # uploaded attachments and generated exports
+      - /lzcapp/var/storage:/var/www/html/storage
+
+  # Solidtime queues work (notifications, exports) in the database; without a
+  # worker those jobs never run. Same image, different CONTAINER_MODE.
+  worker:
+    image: docker.1ms.run/solidtime/solidtime:0.22.1
+    depends_on:
+      - db
+      - solidtime
+    environment:
+      - CONTAINER_MODE=worker
+      - WORKER_COMMAND=php /var/www/html/artisan queue:work
+      - APP_ENV=production
+      - APP_DEBUG=false
+      - |-
+        APP_URL=https://{{ .S.AppDomain }}
+      - |-
+        APP_KEY=base64:{{ printf "%.32s" (printf "%s%s" (stable_secret "solidtime_app_key_a") (stable_secret "solidtime_app_key_b")) | b64enc }}
+      - DB_CONNECTION=pgsql
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_DATABASE=solidtime
+      - DB_USERNAME=solidtime
+      - |-
+        DB_PASSWORD={{ printf "%x" (stable_secret "solidtime_db_password") }}
+      - QUEUE_CONNECTION=database
+      - TZ=Asia/Shanghai
+    binds:
+      - /lzcapp/var/storage:/var/www/html/storage
+
+usage: |
+  Solidtime 是时间追踪工具，适合自由职业者和小团队。给项目建任务，用计时器或手动补录工时，能区分可计费与不可计费时间，最后按月出报表。
+
+  使用方法：
+  1. 打开应用，第一次会进入**注册页**。用你的邮箱注册——**第一个注册的账号就是管理员**。
+  2. 注册用的邮箱同时也配成了超级管理员（SUPER_ADMINS），
+     所以你能访问 `/admin` 超级管理面板，用来管理所有组织。
+  3. 建 Organization → Project → Task，开始计时。
+  4. 在报表页按项目、成员、时间段查看工时汇总。
+  5. 建议：注册完把自助注册关掉（面板里可设置），避免陌生人注册进来。
+
+  数据与安全：
+  - 数据库存在 /lzcapp/var/pgdata，上传的附件和导出文件在 /lzcapp/var/storage，
+    卸载会一并删除，请定期备份。
+  - **没有内置默认口令**：账号由你自己注册。
+  - 数据库密码与应用密钥都是每个部署随机生成的稳定值，重启不会掉登录态。
+  - 应用直接对外开放，由 Solidtime 自己的登录页鉴权：
+    自带账号体系的服务再套一层平台鉴权会造成重复登录，所以用 public_path。
+
+  说明：
+  - 三容器：Solidtime(web) + worker + PostgreSQL 15。
+    worker 负责处理后台任务（通知、导出），没有它这类任务不会执行。
+  - 首次启动会自动建表（AUTO_DB_MIGRATE），可能等半分钟到一分钟。
+  - 未启用 scheduler 容器：**定时任务（如周期性邮件提醒）不会自动触发**，
+    手动操作与报表正常。
+  - 未配置 SMTP，邮件通知与找回密码需要你先在环境里填邮件服务。
+  - 未做真机验证：注册首个账号、建项目计时、查看报表以及重启后数据留存
+    均未在设备上实测。

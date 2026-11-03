@@ -1,0 +1,12 @@
+params:
+  - id: admin_email
+    type: string
+    name: Admin email
+    description: "Register with this email; it is also granted super-admin access."
+    default_value: "admin@localhost"
+    optional: false
+locales:
+  zh:
+    admin_email:
+      name: 管理员邮箱
+      description: 用这个邮箱注册第一个账号，它会同时获得超级管理员权限。
