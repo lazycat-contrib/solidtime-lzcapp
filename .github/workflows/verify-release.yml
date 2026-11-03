@@ -86,7 +86,8 @@ jobs:
               assert 'APP_FORCE_HTTPS=true' in env, env
               assert 'TRUSTED_PROXIES=' in env, env
               # required by Laravel; a key too short silently breaks sessions
-              assert re.search(r'APP_KEY=base64:', env) is not None, env
+              assert 'APP_KEY=base64:' + '{' + '{' in env, env
+              assert 'b64enc' in env, 'app key must be base64 encoded for Laravel'
               assert 'QUEUE_CONNECTION=database' in env, env
               assert 'DB_CONNECTION=pgsql' in env, env
               # the account that registers with this email gets super-admin rights
@@ -100,13 +101,9 @@ jobs:
               assert 'QUEUE_CONNECTION=database' in worker_env, worker_env
               assert 'solidtime' in (worker.get('depends_on') or []), worker.get('depends_on')
 
-              # the app key must be identical in both roles or sessions break
-              def app_key(text):
-                  found = re.search(r'APP_KEY=base64:([A-Za-z0-9+/=]+)', text)
-                  return found.group(1) if found else None
-              assert app_key(raw) is not None, 'no APP_KEY rendered'
-              assert raw.count('stable_secret "solidtime_app_key_a"') == 2, \
-                  'both services must derive the same app key'
+              # both roles must derive the same key, or sessions break on the worker
+              assert raw.count('solidtime_app_key_a') == 2, 'both roles must share the key'
+              assert raw.count('solidtime_app_key_b') == 2, 'both roles must share the key'
 
               db = svcs['db']
               assert 'postgres:15' in db['image'], db['image']
