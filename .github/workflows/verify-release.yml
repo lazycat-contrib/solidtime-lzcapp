@@ -136,7 +136,7 @@ jobs:
                   target = main_lic[0] if main_lic else lic[0]
                   license_text = content.extractfile(target).read().decode()
                   flat = ' '.join(license_text.split())
-                  assert 'GNU AFFERO GENERAL PUBLIC LICENSE' in flat, flat[:150]
+                  assert 'Affero General Public License' in flat, flat[:150]
 
           result = {
               'verified': True,
