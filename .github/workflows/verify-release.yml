@@ -1,0 +1,155 @@
+name: Verify Solidtime Release on GitHub
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to verify
+        required: false
+        default: v0.22.1
+permissions:
+  contents: read
+concurrency:
+  group: solidtime-release-verification
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="$(gh release view --json tagName --jq .tagName)"; fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Download exact Release asset on runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ASSET_NAME="community.lazycat.app.solidtime-${RELEASE_TAG}.lpk"
+          echo "ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
+          gh release view "$RELEASE_TAG" --json tagName,assets > release-metadata.json
+          gh release download "$RELEASE_TAG" --pattern "$ASSET_NAME" --dir verify-pkg
+
+      - name: Verify package contents
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, tarfile, yaml
+
+          tag = os.environ['RELEASE_TAG']
+          name = os.environ['ASSET_NAME']
+          pkg = __import__('pathlib').Path('verify-pkg') / name
+          assert pkg.is_file(), pkg
+
+          h = hashlib.sha256()
+          with pkg.open('rb') as fh:
+              for chunk in iter(lambda: fh.read(1 << 20), b''):
+                  h.update(chunk)
+
+          with tarfile.open(pkg, 'r:') as package:
+              members = package.getnames()
+              for required in ('manifest.yml', 'package.yml', 'content.tar', 'icon.png'):
+                  assert required in members, (required, members)
+
+              info = yaml.safe_load(package.extractfile('package.yml').read())
+              assert info['package'] == 'community.lazycat.app.solidtime', info['package']
+              assert info['name'] == 'Solidtime', info['name']
+              assert info['version'] == tag.lstrip('v'), (info['version'], tag)
+              assert info['license'] == 'AGPL-3.0', info['license']
+              assert info['min_os_version'] == '1.5.0', info['min_os_version']
+
+              raw = package.extractfile('manifest.yml').read().decode()
+              m = yaml.safe_load(raw)
+              app = m['application']
+              assert app['subdomain'] == 'solidtime', app['subdomain']
+              # own accounts plus an /admin panel: no platform gate in front
+              assert app.get('public_path') == ['/'], app.get('public_path')
+              ups = app['upstreams']
+              # the official docs state the container's default port is 8000
+              assert any(u['location'] == '/' and 'solidtime:8000' in (u.get('backend') or '')
+                         for u in ups), ups
+
+              svcs = m['services']
+              assert set(svcs) == {'db', 'solidtime', 'worker'}, set(svcs)
+
+              svc = svcs['solidtime']
+              assert 'solidtime/solidtime' in svc['image'], svc['image']
+              assert svc['image'].endswith(':' + tag.lstrip('v')), svc['image']
+              env = ' '.join(str(x) for x in svc['environment'])
+              assert 'CONTAINER_MODE=http' in env, env
+              # tables are created on first boot; no separate init service needed
+              assert 'AUTO_DB_MIGRATE=true' in env, env
+              assert 'APP_URL=https://' in env, env
+              assert 'APP_FORCE_HTTPS=true' in env, env
+              assert 'TRUSTED_PROXIES=' in env, env
+              # required by Laravel; a key too short silently breaks sessions
+              assert re.search(r'APP_KEY=base64:', env) is not None, env
+              assert 'QUEUE_CONNECTION=database' in env, env
+              assert 'DB_CONNECTION=pgsql' in env, env
+              # the account that registers with this email gets super-admin rights
+              assert 'SUPER_ADMINS=' in env and '.U.admin_email' in env, env
+              assert any(b.endswith(':/var/www/html/storage') for b in svc['binds']), svc['binds']
+
+              # jobs are queued in the database, so a worker is mandatory
+              worker = svcs['worker']
+              worker_env = ' '.join(str(x) for x in worker['environment'])
+              assert 'CONTAINER_MODE=worker' in worker_env, worker_env
+              assert 'QUEUE_CONNECTION=database' in worker_env, worker_env
+              assert 'solidtime' in (worker.get('depends_on') or []), worker.get('depends_on')
+
+              # the app key must be identical in both roles or sessions break
+              def app_key(text):
+                  found = re.search(r'APP_KEY=base64:([A-Za-z0-9+/=]+)', text)
+                  return found.group(1) if found else None
+              assert app_key(raw) is not None, 'no APP_KEY rendered'
+              assert raw.count('stable_secret "solidtime_app_key_a"') == 2, \
+                  'both services must derive the same app key'
+
+              db = svcs['db']
+              assert 'postgres:15' in db['image'], db['image']
+              assert any(b.endswith(':/var/lib/postgresql/data') for b in db['binds']), db['binds']
+              # secrets are per-deployment and hex-encoded so the DSN stays valid
+              assert 'printf "%x"' in raw, 'database secrets should be hex-encoded'
+
+              params = yaml.safe_load(package.extractfile('deploy_params.yml').read())
+              by_id = {q['id']: q for q in params['params']}
+              assert set(by_id) == {'admin_email'}, set(by_id)
+              refs = set(re.findall(r'\.U\.([A-Za-z0-9_]+)', raw))
+              assert refs <= set(by_id), (refs, set(by_id))
+
+              assert 'healthcheck' not in svc, svc
+              assert 'lzc-file-chooser' not in raw
+              assert 'docker.sock' not in raw
+              assert 'privileged' not in raw
+              assert 'usage' in m and str(m['usage']).strip(), 'usage section missing'
+              usage_text = str(m['usage'])
+              assert ('真机验证' in usage_text or '实机验证' in usage_text), 'usage must state no device test'
+              # the omitted scheduler is a real limit and must be disclosed
+              assert 'scheduler' in usage_text.lower() or '定时' in usage_text, \
+                  'usage should disclose that scheduled tasks are not enabled'
+
+              with tarfile.open(fileobj=package.extractfile('content.tar')) as content:
+                  cmembers = content.getnames()
+                  lic = [n for n in cmembers if 'licenses/' in n]
+                  assert lic, cmembers
+                  main_lic = [n for n in lic if n.endswith('/LICENSE')]
+                  target = main_lic[0] if main_lic else lic[0]
+                  license_text = content.extractfile(target).read().decode()
+                  flat = ' '.join(license_text.split())
+                  assert 'GNU AFFERO GENERAL PUBLIC LICENSE' in flat, flat[:150]
+
+          result = {
+              'verified': True,
+              'tag': tag,
+              'sha256': h.hexdigest(),
+              'size': pkg.stat().st_size,
+              'runtime_tested': False,
+              'note': 'http + worker + PG15; AUTO_DB_MIGRATE on the app; super admin pinned by email',
+          }
+          print(json.dumps(result))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('```json\n' + json.dumps(result, indent=2) + '\n```\n')
+          PY
